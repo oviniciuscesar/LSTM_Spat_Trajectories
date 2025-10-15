@@ -8,6 +8,11 @@ import os
 # Importa a definição do modelo do script de treino
 from LSTMTrajTrain import LSTM_Model, INPUT_SIZE_PER_STEP, LSTM_HIDDEN_SIZE, LSTM_NUM_LAYERS, OUTPUT_SIZE, SEQUENCE_LENGTH, MODEL_SAVE_PATH
 
+SEED = 42  # Escolha qualquer valor inteiro
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
 plots_dir = "plots"
 os.makedirs(plots_dir, exist_ok=True)
 
@@ -99,7 +104,7 @@ if __name__ == "__main__":
 
 
     # Carrega o dataset original para pegar as sementes
-    full_data = np.loadtxt('data/SpatTrajData.txt', delimiter=' ', converters={-1: lambda s: float(s.strip().replace(';',''))})
+    full_data = np.loadtxt('data/_SpatTrajData.txt', delimiter=' ', converters={-1: lambda s: float(s.strip().replace(';',''))})
     
     #reorganiza os dados para facilitar a extração das sementes
     t_and_type = full_data[:, :4]

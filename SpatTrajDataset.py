@@ -7,6 +7,10 @@ import matplotlib.pyplot as plt
 
 # --- 1 CONFIGURAÇÃO ---
 
+SEED = 42  # Escolha qualquer valor inteiro
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
 # diretório atual
 script_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(script_dir, 'data')
@@ -18,10 +22,10 @@ if not os.path.exists(plot_dir):
 
 # Parâmetros do Dataset
 NUM_PASSOS = 500  # Aumenta a densidade
-ADICIONAR_RUIDO = True # Adiciona ruído pequeno aos labels
+ADICIONAR_RUIDO = False # Adiciona ruído pequeno aos labels
 ARQUIVO_SAIDA = os.path.join(data_dir, 'SpatTrajData.txt')
 
-# Parâmetros de Normalização (consistentes com o que já usamos)
+# Parâmetros de Normalização
 MIN_RADIUS_NORM = 0.0
 MAX_RADIUS_NORM = 1.0
 MIN_DUR_NORM = 100.0

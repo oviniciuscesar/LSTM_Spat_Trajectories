@@ -6,6 +6,11 @@ import os
 
 # --- 1 CONFIGURAÇÃO E HIPERPARÂMETROS ---
 
+SEED = 42  # Escolha qualquer valor inteiro
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
 # diretórios
 script_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(script_dir, 'data')
@@ -27,7 +32,7 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 1500
 
 # arquivo de dados e modelo
-DATA_FILE_PATH = os.path.join(data_dir, 'SpatTrajData.txt')
+DATA_FILE_PATH = os.path.join(data_dir, '_SpatTrajData.txt')
 MODEL_SAVE_PATH = os.path.join(model_dir, 'lstm_model.pth')
 
 
@@ -90,7 +95,7 @@ class LSTM_Model(nn.Module):
         self.tanh = nn.Tanh()
 
     # forward: LSTM -> Linear -> Tanh
-    def forward(self, x):
+    def forward(self, x, temperature: float = 1.0):
         # Inicializa o estado oculto com zeros
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
@@ -103,8 +108,16 @@ class LSTM_Model(nn.Module):
         
         # Passa pela camada linear final
         out = self.fc(out)
-        out = self.tanh(out)
-        return out
+
+        # aplica a temperatura: divide a saída da camada linear pelo valor da temperatura
+        # garante que a temperatura não seja zero para evitar divisão por zero
+        if temperature <= 0.0:
+            temperature = 1.0
+        out_temp = out / temperature
+
+        # Passa pela função de ativação final
+        out_final = self.tanh(out_temp)
+        return out_final
 
 
 # --- 4 TREINAMENTO ---

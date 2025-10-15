@@ -9,6 +9,11 @@ import math
 # Importa a definição do modelo
 from LSTMTrajTrain import LSTM_Model, INPUT_SIZE_PER_STEP, LSTM_HIDDEN_SIZE, LSTM_NUM_LAYERS, OUTPUT_SIZE, SEQUENCE_LENGTH, MODEL_SAVE_PATH
 
+SEED = 42  # Escolha qualquer valor inteiro
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
 # diretório para salvar plots de teste
 plots_dir = "plots"
 os.makedirs(plots_dir, exist_ok=True)
@@ -34,12 +39,13 @@ class LSTM_SpatWrapper(nn.Module):
         self.INPUT_SIZE_PER_STEP = INPUT_SIZE_PER_STEP
 
         # REGISTRO DE MÉTODOS E ATRIBUTOS (compatível com TorchScript)
-        self._methods = ["forward"]
-        self._attributes = ["forward_input_shape", "forward_output_shape"]
-
+        self._methods = ["forward", "set_temperature"]
+        self._attributes = ["forward_input_shape", "forward_output_shape", "temperature"]
+        
         # SHAPES DE ENTRADA E SAÍDA
         self.forward_input_shape = [self.SEQUENCE_LENGTH*self.INPUT_SIZE_PER_STEP]  # [t, traj_type_1, traj_type_2, traj_type_3, radius_norm, az_sin, az_cos, dur_norm]
         self.forward_output_shape = [4]  # retorna [radius_norm, az_sin, az_cos, dur_norm]
+        self.temperature = torch.tensor(1.0)
 
 
     @torch.jit.export
@@ -51,6 +57,15 @@ class LSTM_SpatWrapper(nn.Module):
     def get_attributes(self) -> List[str]:
         """Retorna lista de atributos disponíveis"""
         return self._attributes
+    
+    @torch.jit.export
+    def set_temperature(self, temp: float):
+        """
+        Método para ajustar o atributo de temperatura interno do modelo.
+        """
+        if temp <= 0.0:
+            temp = 0.01 # Evita divisão por zero ou valores negativos
+        self.temperature = torch.tensor(temp)
 
     @torch.jit.export
     def forward(self, input_step: torch.Tensor) -> torch.Tensor:
@@ -60,7 +75,7 @@ class LSTM_SpatWrapper(nn.Module):
         Estados internos são inicializados com zeros a cada chamada do forward.
         """
         input_step = input_step.reshape(1, self.SEQUENCE_LENGTH, self.INPUT_SIZE_PER_STEP)  # [1, seqlength, num_features]
-        return self.model(input_step).squeeze(0).squeeze(0)  # remove as dimensões extras do batch e sequência
+        return self.model(input_step, self.temperature).squeeze(0).squeeze(0)  # remove as dimensões extras do batch e sequência
     
 
 # --- Funções auxiliares  ---
@@ -168,7 +183,7 @@ if __name__ == "__main__":
 
     idx_circulo = np.where((full_features[:, 1] == 0.0) & (full_features[:, 2] == 0.0) & (full_features[:, 3] == 1.0))[0][0]
     seed_circulo = full_features[idx_circulo : idx_circulo + SEQUENCE_LENGTH]
-    tipo_circulo = [0.0, 0.0, 1.0]
+    tipo_circulo = [0.460652, 0.201567, 0.694444] # 0.0160652 0.201567 0.694444
 
     # busca a primeira sequência híbrida [0.5, 0, 0.5]
     idx_hibrida = np.where((full_features[:, 1] == 0.5) & (full_features[:, 2] == 0.5) & (full_features[:, 3] == 0.0))[0][0]
