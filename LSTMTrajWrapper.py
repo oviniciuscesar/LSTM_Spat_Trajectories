@@ -39,13 +39,13 @@ class LSTM_SpatWrapper(nn.Module):
         self.INPUT_SIZE_PER_STEP = INPUT_SIZE_PER_STEP
 
         # REGISTRO DE MÉTODOS E ATRIBUTOS (compatível com TorchScript)
-        self._methods = ["forward", "set_temperature"]
-        self._attributes = ["forward_input_shape", "forward_output_shape", "temperature"]
+        self._methods = ["forward", "set_mix", "get_mix"]
+        self._attributes = ["forward_input_shape", "forward_output_shape", "mix"]
         
         # SHAPES DE ENTRADA E SAÍDA
         self.forward_input_shape = [self.SEQUENCE_LENGTH*self.INPUT_SIZE_PER_STEP]  # [t, traj_type_1, traj_type_2, traj_type_3, radius_norm, az_sin, az_cos, dur_norm]
         self.forward_output_shape = [4]  # retorna [radius_norm, az_sin, az_cos, dur_norm]
-        self.temperature = torch.tensor(1.0)
+        self.mix = torch.tensor([1/3, 1/3, 1/3], dtype=torch.float32)
 
 
     @torch.jit.export
@@ -59,23 +59,29 @@ class LSTM_SpatWrapper(nn.Module):
         return self._attributes
     
     @torch.jit.export
-    def set_temperature(self, temp: float):
-        """
-        Método para ajustar o atributo de temperatura interno do modelo.
-        """
-        if temp <= 0.0:
-            temp = 0.01 # Evita divisão por zero ou valores negativos
-        self.temperature = torch.tensor(temp)
+    def set_mix(self, w0: float, w1: float, w2: float):
+        """Define pesos da mistura latente (interpolação entre tipos)."""
+        m = torch.tensor([w0, w1, w2], dtype=torch.float32)
+        m = torch.clamp(m, min=1e-8)
+        m = m / torch.sum(m)
+        self.mix = m
 
     @torch.jit.export
-    def forward(self, input_step: torch.Tensor) -> torch.Tensor:
+    def get_mix(self) -> List[float]:
+        """Retorna mistura atual (normalizada)."""
+        return [float(self.mix[0]), float(self.mix[1]), float(self.mix[2])]
+
+    @torch.jit.export
+    def forward(self, input_flat: torch.Tensor) -> torch.Tensor:
         """
-        Processa uma sequência de passos [1, seqlength, num_features] e retorna r, sin, cos, dur [4]
-        seqência de passos - t, traj_type1, traj_type2, traj_type3, r, sin, cos, dur [seqlength, num_features] -> Saída: r, sin, cos, dur [num_outputs]
-        Estados internos são inicializados com zeros a cada chamada do forward.
+        Recebe sequência achatada [SEQUENCE_LENGTH*INPUT_SIZE_PER_STEP]
+        Retorna próximo ponto [4]: (radius_norm, az_sin, az_cos, dur_norm)
+        Usa interpolação latente via self.mix.
         """
-        input_step = input_step.reshape(1, self.SEQUENCE_LENGTH, self.INPUT_SIZE_PER_STEP)  # [1, seqlength, num_features]
-        return self.model(input_step, self.temperature).squeeze(0).squeeze(0)  # remove as dimensões extras do batch e sequência
+        x = input_flat.view(1, self.SEQUENCE_LENGTH, self.INPUT_SIZE_PER_STEP)
+        # Usa forward_with_type_mix do modelo
+        y = self.model.forward_mix(x, self.mix)  # (1,4)
+        return y.squeeze(0)
     
 
 # --- Funções auxiliares  ---
@@ -110,18 +116,28 @@ def gerar_trajetoria_original(tipo, num_passos):
 
 
 # teste do wrapper exportado
-def gerar_previsao_trajetoria_wrapper(model, seed_sequence, traj_type, total_revolutions, num_passos):
+def gerar_previsao_trajetoria_wrapper(model, seed_sequence, mix_weights, total_revolutions, num_passos):
     """Gera uma trajetória autorregressiva usando o modelo LSTM treinado."""
     model.eval()
     pontos_previstos = []
     
     # Transforma a semente em um tensor do PyTorch
     current_sequence = torch.tensor(seed_sequence, dtype=torch.float32).unsqueeze(0)
+
+
+    mix = torch.tensor(mix_weights, dtype=torch.float32)
+    mix = torch.clamp(mix, min=1e-8)
+    mix = mix / mix.sum()
+
+    # define a mistura no modelo
+    model.set_mix(float(mix[0].item()), float(mix[1].item()), float(mix[2].item()))
     
     with torch.no_grad():
         for i in range(num_passos):
+            # achata a sequência atual
+            input_flat = current_sequence.view(-1)
             # Faz a previsão do próximo ponto
-            next_point_norm = model(current_sequence).squeeze(0).numpy()
+            next_point_norm = model(input_flat).numpy()
             
             # Decodifica o ponto previsto
             raio_norm, az_sin, az_cos, dur_norm = next_point_norm
@@ -131,15 +147,40 @@ def gerar_previsao_trajetoria_wrapper(model, seed_sequence, traj_type, total_rev
             azimute_real = reconstruir_azimute(az_sin, az_cos, t, total_revolutions)
             
             pontos_previstos.append({'azimuth': azimute_real, 'radius': raio_real})
-            
-            # Cria o próximo passo da sequência de entrada
-            next_input_step = np.array([t] + traj_type + list(next_point_norm))
-            
+
+            # Monta próximo passo: [t, mix0, mix1, mix2, r_norm, sin, cos, dur_norm]
+            next_input_step = np.array([t, mix[0].item(), mix[1].item(), mix[2].item(),
+                                        raio_norm, az_sin, az_cos, dur_norm], dtype=np.float32)
+             
             # Adiciona o novo passo e remove o mais antigo para a próxima iteração
             next_sequence_np = np.vstack([current_sequence.numpy().squeeze(0)[1:], next_input_step])
             current_sequence = torch.from_numpy(next_sequence_np).unsqueeze(0).float()
             
     return pontos_previstos
+
+
+def testar_interpolacao(loaded_model, seed_sequence, w_from, w_to, total_revolutions, num_passos, n_alphas=5, save_path="plots/interpolacao.png", titulo="Interpolação Latente"):
+    """
+    Faz inferência autorregressiva variando alpha entre w_from e w_to e plota as curvas em um gráfico polar.
+    w_from, w_to: listas de 3 pesos (ex.: [1,0,0] e [0,0,1]).
+    """
+    alphas = np.linspace(0.0, 1.0, n_alphas)
+    cmap = plt.get_cmap("viridis")
+    plt.figure(figsize=(7, 7))
+    ax = plt.subplot(111, projection='polar')
+    for i, a in enumerate(alphas):
+        mix = (1.0 - a) * np.array(w_from, dtype=np.float32) + a * np.array(w_to, dtype=np.float32)
+        previsoes = gerar_previsao_trajetoria_wrapper(loaded_model, seed_sequence, mix, total_revolutions=total_revolutions, num_passos=num_passos)
+        color = cmap(i / max(1, n_alphas - 1))
+        ax.plot([p['azimuth'] for p in previsoes], [p['radius'] for p in previsoes],
+                label=f"α={a:.2f} | mix={mix.round(2)}", color=color, linewidth=1.6)
+    ax.set_title(titulo)
+    ax.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Figura de interpolação salva em '{save_path}'.")
 
 if __name__ == "__main__":
     
@@ -196,6 +237,19 @@ if __name__ == "__main__":
     previsoes_espiral = gerar_previsao_trajetoria_wrapper(loaded_model, seed_espiral, tipo_espiral, total_revolutions=6, num_passos=NUM_PONTOS_GERACAO)
     previsoes_circulo = gerar_previsao_trajetoria_wrapper(loaded_model, seed_circulo, tipo_circulo, total_revolutions=1, num_passos=NUM_PONTOS_GERACAO)
     previsoes_hibrida = gerar_previsao_trajetoria_wrapper(loaded_model, seed_hibrida, tipo_hibrida, total_revolutions=6, num_passos=NUM_PONTOS_GERACAO)
+
+    # --- Teste de interpolação: Lissajous (1,0,0) -> Circular (0,0,1) usando a semente Lissajous ---
+    testar_interpolacao(
+        loaded_model,
+        seed_sequence=seed_lissajous,
+        w_from=[1.0, 0.0, 0.0],
+        w_to=[0.0, 0.0, 1.0],
+        total_revolutions=1,
+        num_passos=NUM_PONTOS_GERACAO,
+        n_alphas=6,
+        save_path=os.path.join(plots_dir, "interpolacao_lissajous_to_circular.png"),
+        titulo="Interpolação Latente: Lissajous → Circular"
+    )
 
     # Gera dados originais para comparação
     originais_lissajous = gerar_trajetoria_original('lissajous', NUM_PONTOS_GERACAO)

@@ -21,18 +21,19 @@ if not os.path.exists(model_dir):
 
 # Features de entrada para cada passo da sequência
 INPUT_SIZE_PER_STEP = 8  # t, traj_type1, traj_type2, traj_type3, r, sin, cos, dur
-LSTM_HIDDEN_SIZE = 64  # Tamanho do estado oculto da LSTM
+LSTM_HIDDEN_SIZE = 80  # Tamanho do estado oculto da LSTM
 LSTM_NUM_LAYERS = 2  # Número de camadas da LSTM
 OUTPUT_SIZE = 4  # saída da LSTM: r_norm, sin, cos, dur_norm
+TYPE_EMB_DIM = 16  # dimensão do embedding para os tipos de trajetória
 
 # Parâmetros da sequência e treinamento
 SEQUENCE_LENGTH = 10  # usar os últimos 10 pontos para prever o próximo
 LEARNING_RATE = 0.0001
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 NUM_EPOCHS = 1500
 
 # arquivo de dados e modelo
-DATA_FILE_PATH = os.path.join(data_dir, '_SpatTrajData.txt')
+DATA_FILE_PATH = os.path.join(data_dir, 'SpatTrajData.txt')
 MODEL_SAVE_PATH = os.path.join(model_dir, 'lstm_model.pth')
 
 
@@ -91,11 +92,14 @@ class LSTM_Model(nn.Module):
         self.num_layers = num_layers
         
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.type_embed = nn.Embedding(3, TYPE_EMB_DIM)
+        self.fc1 = nn.Linear(hidden_size + TYPE_EMB_DIM, 32)  # Camada intermediária
+        self.fc2 = nn.Linear(32, 16)  # Camada intermediária
+        self.fc3 = nn.Linear(16, output_size)
         self.tanh = nn.Tanh()
 
     # forward: LSTM -> Linear -> Tanh
-    def forward(self, x, temperature: float = 1.0):
+    def forward(self, x):
         # Inicializa o estado oculto com zeros
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
@@ -105,19 +109,54 @@ class LSTM_Model(nn.Module):
         
         # Pega a saída do último passo de tempo da sequência
         out = out[:, -1, :]
+
+        type_logits = x[:, -1, 1:4]  # (B, 3)
+        type_ids = torch.argmax(type_logits, dim=-1)  # (B,)
+        e_type = self.type_embed(type_ids)  # (B, TYPE_EMB_DIM)
+
+        # Concatena o contexto da LSTM com o embedding de tipo
+        dec_in = torch.cat([out, e_type], dim=-1)
         
         # Passa pela camada linear final
-        out = self.fc(out)
+        out1 = self.fc1(dec_in)
+        out2 = self.fc2(out1)
+        out3 = self.fc3(out2)
+       
 
         # aplica a temperatura: divide a saída da camada linear pelo valor da temperatura
         # garante que a temperatura não seja zero para evitar divisão por zero
-        if temperature <= 0.0:
-            temperature = 1.0
-        out_temp = out / temperature
+        # if temperature <= 0.0:
+        #     temperature = 1.0
+        # out_temp = out3 / temperature
 
         # Passa pela função de ativação final
-        out_final = self.tanh(out_temp)
-        return out_final
+        predicted = self.tanh(out3)
+        return predicted
+    
+    def forward_mix(self, x: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
+        """
+       Gera saída usando uma mistura contínua dos 3 tipos de trajetória no espaço latente.
+        mix: (3,) ou (B,3) com pesos que somam ~1.0 (convexo). Ex.: [alpha, 1-alpha, 0] (interp entre tipo0 e tipo1)
+        """
+        B = x.size(0)
+        device = x.device
+        # LSTM encoder
+        h0 = torch.zeros(self.num_layers, B, self.hidden_size, device=device)
+        c0 = torch.zeros(self.num_layers, B, self.hidden_size, device=device)
+        enc_out, _ = self.lstm(x, (h0, c0))
+        h_last = enc_out[:, -1, :]  # (B, H)
+
+        # Normaliza mix e constrói embedding interpolado
+        if mix.dim() == 1:
+            mix = mix.unsqueeze(0).expand(B, -1)  # (B,3)
+        mix = mix.to(device=device, dtype=self.type_embed.weight.dtype)
+        mix = mix / (mix.sum(dim=-1, keepdim=True).clamp_min(1e-8))
+        # e_mix = mix @ W_emb  -> (B, 3) x (3, D) = (B, D)
+        e_mix = torch.matmul(mix, self.type_embed.weight)  # (B, TYPE_EMB_DIM)
+
+        dec_in = torch.cat([h_last, e_mix], dim=-1)
+        y = self.fc3(self.fc2(self.fc1(dec_in)))
+        return self.tanh(y)
 
 
 # --- 4 TREINAMENTO ---
@@ -147,10 +186,11 @@ if __name__ == "__main__":
     
     print("\nArquitetura do Modelo:")
     print(model)
+    print(f"Embedding de tipos: {model.type_embed.num_embeddings} x {model.type_embed.embedding_dim}")
 
     # Lógica de Early Stopping
     best_val_loss = float('inf')
-    patience = 200
+    patience = 50
     patience_counter = 0
 
     print("\nIniciando o treinamento do modelo LSTM...")
@@ -194,3 +234,20 @@ if __name__ == "__main__":
             
     print("Treinamento concluído.")
     print(f"O melhor modelo LSTM foi salvo em: {MODEL_SAVE_PATH}")
+
+
+# --- Interpolação entre trajetórias no espaço latente (exemplo de uso) ---
+    # Pega 1 batch da validação e interpola entre tipo 0 (circular) e 1 (lissajous)
+    try:
+        model.eval()
+        sequences, _ = next(iter(val_loader))
+        sequences = sequences.to(device)
+        # alpha em [0..1]: (1-alpha)*tipo0 + alpha*tipo1
+        alphas = torch.linspace(0, 1, steps=5, device=device)
+        print("\nInterpolação latente entre tipos (0 -> 1):")
+        for a in alphas:
+            mix = torch.tensor([1.0 - a.item(), a.item(), 0.0], device=device)  # (3,)
+            preds = model.forward_mix(sequences[:4], mix)  # 4 amostras
+            print(f"alpha={a.item():.2f} | saída[0]: {preds[0].detach().cpu().numpy()}")
+    except StopIteration:
+        pass
