@@ -39,12 +39,15 @@ class LSTM_SpatWrapper(nn.Module):
         self.INPUT_SIZE_PER_STEP = INPUT_SIZE_PER_STEP
 
         # REGISTRO DE MÉTODOS E ATRIBUTOS (compatível com TorchScript)
-        self._methods = ["forward", "set_mix", "get_mix"]
-        self._attributes = ["forward_input_shape", "forward_output_shape", "mix"]
+        self._methods = ["forward", "mix", "forward_mix", "get_mix"]
+        self._attributes = ["forward_input_shape", "forward_output_shape", "forward_mix_input_shape", "forward_mix_output_shape", "mix"]
         
         # SHAPES DE ENTRADA E SAÍDA
         self.forward_input_shape = [self.SEQUENCE_LENGTH*self.INPUT_SIZE_PER_STEP]  # [t, traj_type_1, traj_type_2, traj_type_3, radius_norm, az_sin, az_cos, dur_norm]
         self.forward_output_shape = [4]  # retorna [radius_norm, az_sin, az_cos, dur_norm]
+
+        self.forward_mix_input_shape = [self.SEQUENCE_LENGTH*self.INPUT_SIZE_PER_STEP]
+        self.forward_mix_output_shape = [4]  # retorna [radius_norm, az_sin, az_cos, dur_norm]
         self.mix = torch.tensor([1/3, 1/3, 1/3], dtype=torch.float32)
 
 
@@ -59,12 +62,15 @@ class LSTM_SpatWrapper(nn.Module):
         return self._attributes
     
     @torch.jit.export
-    def set_mix(self, w0: float, w1: float, w2: float):
-        """Define pesos da mistura latente (interpolação entre tipos)."""
-        m = torch.tensor([w0, w1, w2], dtype=torch.float32)
-        m = torch.clamp(m, min=1e-8)
-        m = m / torch.sum(m)
-        self.mix = m
+    def set_mix(self, w: torch.Tensor) -> None:
+        """Aceita Tensor com 3 elementos do PD."""
+        if w.dtype not in (torch.float32, torch.float64):
+            w = w.to(torch.float32)
+        w = w.view(-1)
+        if w.numel() != 3:
+            raise RuntimeError("set_mix_tensor: esperado tensor com 3 elementos.")
+        w = torch.clamp(w, min=1e-8)
+        self.mix = (w / w.sum()).to(torch.float32)
 
     @torch.jit.export
     def get_mix(self) -> List[float]:
@@ -78,9 +84,24 @@ class LSTM_SpatWrapper(nn.Module):
         Retorna próximo ponto [4]: (radius_norm, az_sin, az_cos, dur_norm)
         Usa interpolação latente via self.mix.
         """
-        x = input_flat.view(1, self.SEQUENCE_LENGTH, self.INPUT_SIZE_PER_STEP)
-        # Usa forward_with_type_mix do modelo
-        y = self.model.forward_mix(x, self.mix)  # (1,4)
+        # faz reshape da entrada achatada
+        x = input_flat.reshape(1, self.SEQUENCE_LENGTH, self.INPUT_SIZE_PER_STEP)
+        y = self.model.forward(x)  # (1,4)
+        return y.squeeze(0)
+    
+
+    @torch.jit.export
+    def forward_mix(self, input_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Recebe sequência achatada [SEQUENCE_LENGTH*INPUT_SIZE_PER_STEP]
+        Retorna próximo ponto [4]: (radius_norm, az_sin, az_cos, dur_norm)
+        Usa interpolação latente via mix.
+        mix: (3,) com pesos que somam ~1.0 (convexo). Ex.: [alpha, 1-alpha, 0] (interp entre tipo0 e tipo1)
+        """
+        # faz reshape da entrada achatada
+        x = input_flat.reshape(1, self.SEQUENCE_LENGTH, self.INPUT_SIZE_PER_STEP)
+        # passa pela forward com mix passado pelo método set_mix
+        y = self.model.forward_mix(x, self.mix)  # (B,4)
         return y.squeeze(0)
     
 
@@ -130,7 +151,7 @@ def gerar_previsao_trajetoria_wrapper(model, seed_sequence, mix_weights, total_r
     mix = mix / mix.sum()
 
     # define a mistura no modelo
-    model.set_mix(float(mix[0].item()), float(mix[1].item()), float(mix[2].item()))
+    model.set_mix(mix)
     
     with torch.no_grad():
         for i in range(num_passos):
@@ -181,6 +202,8 @@ def testar_interpolacao(loaded_model, seed_sequence, w_from, w_to, total_revolut
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Figura de interpolação salva em '{save_path}'.")
+
+
 
 if __name__ == "__main__":
     
@@ -266,22 +289,23 @@ if __name__ == "__main__":
     ]
 
     for ax, (nome, orig, prev) in zip(axs, trajetorias):
-        ax.plot([p['azimuth'] for p in prev], [p['radius'] for p in prev], label='LSTM (Wrapper)', color='red', linestyle='--')
+        ax.plot([p['azimuth'] for p in prev], [p['radius'] for p in prev], label='LSTM', color='red', linestyle='--')
         ax.set_title(nome)
         ax.legend(loc='upper right')
 
-    plt.suptitle('Reconstrução das Trajetórias (LSTM Wrapper)')
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, "trajetorias_originais_LSTM_wrapper.png"), dpi=300)
+    fig.subplots_adjust(top=0.88, wspace=0.25)
+    plt.suptitle('Reconstrução das Trajetórias (LSTM)', fontsize=16)
+    # plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "recon_orig_traj_wrapper.png"), dpi=300)
     plt.close()
-    print("Figura corrigida das três trajetórias salva em 'plots/trajetorias_originais_LSTM_wrapper.png'.")
+    print("Figura corrigida das três trajetórias salva em 'plots/recon_orig_traj_wrapper.png'.")
 
     plt.figure(figsize=(8, 8))
     ax = plt.subplot(111, projection='polar')
-    ax.plot([p['azimuth'] for p in previsoes_hibrida], [p['radius'] for p in previsoes_hibrida], label='LSTM (Wrapper)', color='red', linestyle='--')
+    ax.plot([p['azimuth'] for p in previsoes_hibrida], [p['radius'] for p in previsoes_hibrida], label='LSTM', color='red', linestyle='--')
     ax.set_title('Reconstrução da Trajetória Híbrida')
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, "trajetoria_hibrida_LSTM_wrapper.png"), dpi=300)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(os.path.join(plots_dir, "recon_hibrid_traj_wrapper.png"), dpi=300)
     plt.close()
-    print("Figura da trajetória híbrida salva em 'plots/trajetoria_hibrida_lstm_wrapper.png'.")
+    print("Figura da trajetória híbrida salva em 'plots/recon_hibrid_traj_wrapper.png'.")

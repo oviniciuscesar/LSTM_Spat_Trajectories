@@ -21,15 +21,15 @@ if not os.path.exists(model_dir):
 
 # Features de entrada para cada passo da sequência
 INPUT_SIZE_PER_STEP = 8  # t, traj_type1, traj_type2, traj_type3, r, sin, cos, dur
-LSTM_HIDDEN_SIZE = 80  # Tamanho do estado oculto da LSTM
-LSTM_NUM_LAYERS = 2  # Número de camadas da LSTM
+LSTM_HIDDEN_SIZE = 256  # Tamanho do estado oculto da LSTM
+LSTM_NUM_LAYERS = 1  # Número de camadas da LSTM
 OUTPUT_SIZE = 4  # saída da LSTM: r_norm, sin, cos, dur_norm
 TYPE_EMB_DIM = 16  # dimensão do embedding para os tipos de trajetória
 
 # Parâmetros da sequência e treinamento
-SEQUENCE_LENGTH = 10  # usar os últimos 10 pontos para prever o próximo
-LEARNING_RATE = 0.0001
-BATCH_SIZE = 64
+SEQUENCE_LENGTH = 20  # usar os últimos 20 pontos para prever o próximo
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 32
 NUM_EPOCHS = 1500
 
 # arquivo de dados e modelo
@@ -94,7 +94,9 @@ class LSTM_Model(nn.Module):
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.type_embed = nn.Embedding(3, TYPE_EMB_DIM)
         self.fc1 = nn.Linear(hidden_size + TYPE_EMB_DIM, 32)  # Camada intermediária
+        self.relu = nn.ReLU()
         self.fc2 = nn.Linear(32, 16)  # Camada intermediária
+        self.relu2 = nn.ReLU()
         self.fc3 = nn.Linear(16, output_size)
         self.tanh = nn.Tanh()
 
@@ -119,19 +121,15 @@ class LSTM_Model(nn.Module):
         
         # Passa pela camada linear final
         out1 = self.fc1(dec_in)
+        out1 = self.relu(out1)
         out2 = self.fc2(out1)
+        out2 = self.relu2(out2)
         out3 = self.fc3(out2)
        
-
-        # aplica a temperatura: divide a saída da camada linear pelo valor da temperatura
-        # garante que a temperatura não seja zero para evitar divisão por zero
-        # if temperature <= 0.0:
-        #     temperature = 1.0
-        # out_temp = out3 / temperature
-
+    
         # Passa pela função de ativação final
         predicted = self.tanh(out3)
-        return predicted
+        return predicted # shape: (B, output_size)
     
     def forward_mix(self, x: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
         """
@@ -155,8 +153,12 @@ class LSTM_Model(nn.Module):
         e_mix = torch.matmul(mix, self.type_embed.weight)  # (B, TYPE_EMB_DIM)
 
         dec_in = torch.cat([h_last, e_mix], dim=-1)
-        y = self.fc3(self.fc2(self.fc1(dec_in)))
-        return self.tanh(y)
+        # y = self.fc3(self.fc2(self.fc1(dec_in)))
+
+        out1 = torch.relu(self.fc1(dec_in)) # Adiciona ReLU
+        out2 = torch.relu(self.fc2(out1))   # Adiciona ReLU
+        out3 = self.fc3(out2)
+        return self.tanh(out3)
 
 
 # --- 4 TREINAMENTO ---
